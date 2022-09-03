@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,7 +38,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,10 +45,114 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-
+	for {
+		// send an RPC to the coordinator asking for a task.
+		args := WorkerArgs{}
+		reply := WorkerReply{}
+		ok := call("Coordinator.EmitJob", &args, &reply)
+		if !ok {
+			fmt.Printf("RPC Error: cannot ask for job!")
+		}
+		// read that file and call the application function, as in mrsequential.go
+		switch reply.TaskType {
+		case SCHEDULE:
+			time.Sleep(1000)
+		case MAP:
+			doMapJob(mapf, reply)
+			break
+		case REDUCE:
+			doReduceJob(reducef, reply)
+			break
+		case FINISH:
+			return
+		default:
+			fmt.Printf("worker got unknown task.")
+		}
+	}
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+}
+
+func doMapJob(mapf func(string, string) []KeyValue, reply WorkerReply) {
+	var intermediate []KeyValue
+	file, err := os.Open(reply.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", reply.Filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", reply.Filename)
+	}
+	kva := mapf(reply.Filename, string(content))
+	file.Close()
+	intermediate = append(intermediate, kva...)
+
+	buckets := make([][]KeyValue, reply.NReduce)
+	for idx := range buckets {
+		buckets[idx] = []KeyValue{}
+	}
+	for _, kva := range intermediate {
+		// The map part of your worker can use the ihash(key) function to pick the reduce task for a given key.
+		idx := ihash(kva.Key) % reply.NReduce
+		buckets[idx] = append(buckets[idx], kva)
+	}
+	for idx, _ := range buckets {
+		oname := "mr-" + strconv.Itoa(reply.TaskID) + "-" + strconv.Itoa(idx)
+		ofile, _ := os.Create(oname)
+		// The worker's map task code will need a way to store intermediate key/value pairs in files
+		// a way that can be correctly read back during reduce tasks is to use Go's encoding/json package
+		enc := json.NewEncoder(ofile)
+		for _, kva := range buckets[idx] {
+			err := enc.Encode(&kva)
+			if err != nil {
+				log.Fatalf("cannot write into %v", oname)
+			}
+		}
+		ofile.Close()
+	}
+}
+
+// A reasonable naming convention for intermediate files is mr-X-Y,
+// where X is the Map task number, and Y is the reduce task number.
+
+func doReduceJob(reducef func(string, []string) string, reply WorkerReply) {
+	oname := "mr-out-0"
+	ofile, _ := os.Create(oname)
+
+	file, _ := os.Open(reply.Filename)
+	dec := json.NewDecoder(file)
+	var intermediate []KeyValue
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			break
+		}
+		intermediate = append(intermediate, kv)
+	}
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
 }
 
 //
@@ -44,7 +161,6 @@ func Worker(mapf func(string, string) []KeyValue,
 // the RPC argument and reply types are defined in rpc.go.
 //
 func CallExample() {
-
 	// declare an argument structure.
 	args := ExampleArgs{}
 
