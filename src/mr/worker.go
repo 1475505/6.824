@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -24,7 +25,7 @@ type KeyValue struct {
 type ByKey []KeyValue
 
 // for sorting by key.
-func (a ByKey) Len() int           { return len(a) }
+func (b ByKey) Len() int           { return len(b) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
@@ -43,20 +44,20 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
 	// Your worker implementation here.
 	for {
 		// send an RPC to the coordinator asking for a task.
 		args := WorkerArgs{}
 		reply := WorkerReply{}
 		ok := call("Coordinator.EmitJob", &args, &reply)
+		fmt.Printf("Executing Job: %v %v\n", reply.TaskType, reply.TaskID)
 		if !ok {
 			fmt.Printf("RPC Error: cannot ask for job!")
 		}
 		// read that file and call the application function, as in mrsequential.go
 		switch reply.TaskType {
 		case SCHEDULE:
-			time.Sleep(1000)
+			time.Sleep(1000 * time.Millisecond)
 		case MAP:
 			doMapJob(mapf, reply)
 			break
@@ -110,6 +111,8 @@ func doMapJob(mapf func(string, string) []KeyValue, reply WorkerReply) {
 			}
 		}
 		ofile.Close()
+		doneArg := WorkerArgs{MAP, reply.TaskID}
+		call("Coordinator.DoneTask", &doneArg, nil)
 	}
 }
 
@@ -117,19 +120,24 @@ func doMapJob(mapf func(string, string) []KeyValue, reply WorkerReply) {
 // where X is the Map task number, and Y is the reduce task number.
 
 func doReduceJob(reducef func(string, []string) string, reply WorkerReply) {
-	oname := "mr-out-0"
+	intermediate := []KeyValue{}
+	for i := 0; i < reply.NMAP; i++ {
+		iname := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.TaskID)
+		file, _ := os.Open(iname)
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+	sort.Sort(ByKey(intermediate))
+	oname := "mr-out-" + strconv.Itoa(reply.TaskID)
 	ofile, _ := os.Create(oname)
 
-	file, _ := os.Open(reply.Filename)
-	dec := json.NewDecoder(file)
-	var intermediate []KeyValue
-	for {
-		var kv KeyValue
-		if err := dec.Decode(&kv); err != nil {
-			break
-		}
-		intermediate = append(intermediate, kv)
-	}
 	//
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
@@ -153,6 +161,9 @@ func doReduceJob(reducef func(string, []string) string, reply WorkerReply) {
 	}
 
 	ofile.Close()
+
+	doneArg := WorkerArgs{REDUCE, reply.TaskID}
+	call("Coordinator.DoneTask", &doneArg, nil)
 }
 
 //

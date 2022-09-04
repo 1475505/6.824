@@ -38,6 +38,8 @@ const (
 
 // Add your RPC definitions here.
 type WorkerArgs struct {
+	TaskType int
+	TaskID   int
 }
 
 type WorkerReply struct {

@@ -36,14 +36,14 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 	reply.NReduce = c.NReduce
 	c.lock.Lock()
 	if c.DoneReduce == c.NReduce {
-		reply.TaskType = UNDEFINED
+		reply.TaskType = FINISH
 		return nil
 	}
 	if c.DoneMap < c.NMap {
 		i := c.DoneMap
 		for i < c.NMap {
-			if c.MapJobs[i] != 0 {
-				c.MapJobs[i] = 1
+			if c.MapJobs[i] == INIT {
+				c.MapJobs[i] = PROCESSING
 				break
 			}
 			i++
@@ -54,30 +54,42 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 			return nil
 		} else {
 			reply.TaskType = MAP
-			c.lock.Unlock()
 			reply.Filename = c.Files[i]
+			c.lock.Unlock()
 		}
 	} else {
 		i := c.DoneReduce
 		for i < c.NReduce {
-			if c.ReduceJobs[i] != 0 {
-				c.ReduceJobs[i] = 1
+			if c.ReduceJobs[i] == INIT {
+				c.ReduceJobs[i] = PROCESSING
 				break
 			}
 			i++
 		}
-		if i == c.NReduce {
+		if i >= c.NReduce {
 			reply.TaskType = SCHEDULE
 			reply.TaskID = i
 			c.lock.Unlock()
 			return nil
 		} else {
-			reply.TaskType = MAP
+			reply.TaskType = REDUCE
 			reply.TaskID = i
 			c.lock.Unlock()
-			reply.Filename = c.Files[i]
 		}
 	}
+	return nil
+}
+
+func (c *Coordinator) DoneTask(args *WorkerArgs, reply *WorkerReply) error {
+	c.lock.Lock()
+	if args.TaskType == MAP {
+		c.MapJobs[args.TaskID] = DONE
+		c.DoneMap++
+	} else if args.TaskType == REDUCE {
+		c.ReduceJobs[args.TaskID] = DONE
+		c.DoneReduce++
+	}
+	c.lock.Unlock()
 	return nil
 }
 
@@ -113,8 +125,12 @@ func (c *Coordinator) server() {
 //
 func (c *Coordinator) Done() bool {
 	ret := false
-
+	c.lock.Lock()
 	// Your code here.
+	if c.NReduce == c.DoneReduce {
+		ret = true
+	}
+	c.lock.Unlock()
 
 	return ret
 }
