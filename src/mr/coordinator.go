@@ -41,7 +41,7 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 	if c.DoneMap < c.NMap {
 		i := c.DoneMap
 		for i < c.NMap {
-			if c.MapJobs[i] == DONE {
+			if !runningMapJob && c.MapJobs[i] == DONE {
 				c.DoneMap = i + 1
 			} else if c.MapJobs[i] == INIT {
 				c.MapJobs[i] = PROCESSING
@@ -72,7 +72,7 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 			return nil
 		}
 		for i < c.NReduce {
-			if c.ReduceJobs[i] == DONE {
+			if !runningReduceJob && c.ReduceJobs[i] == DONE {
 				c.DoneReduce = i + 1
 			} else if c.ReduceJobs[i] == INIT {
 				c.ReduceJobs[i] = PROCESSING
