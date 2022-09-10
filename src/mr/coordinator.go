@@ -37,6 +37,7 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 	reply.NMAP = c.NMap
 	reply.NReduce = c.NReduce
 	c.lock.Lock()
+	runningMapJob := false
 	if c.DoneMap < c.NMap {
 		i := c.DoneMap
 		for i < c.NMap {
@@ -45,10 +46,12 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 			} else if c.MapJobs[i] == INIT {
 				c.MapJobs[i] = PROCESSING
 				break
+			} else if c.MapJobs[i] == PROCESSING {
+				runningMapJob = true
 			}
 			i++
 		}
-		if i >= c.NMap {
+		if i >= c.NMap || runningMapJob {
 			reply.TaskType = SCHEDULE
 			c.lock.Unlock()
 			return nil
@@ -62,6 +65,7 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 		}
 	} else {
 		i := c.DoneReduce
+		runningReduceJob := false
 		if i == c.NReduce {
 			reply.TaskType = FINISH
 			c.lock.Unlock()
@@ -70,14 +74,15 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 		for i < c.NReduce {
 			if c.ReduceJobs[i] == DONE {
 				c.DoneReduce = i + 1
-			}
-			if c.ReduceJobs[i] == INIT {
+			} else if c.ReduceJobs[i] == INIT {
 				c.ReduceJobs[i] = PROCESSING
 				break
+			} else if c.ReduceJobs[i] == PROCESSING {
+				runningReduceJob = true
 			}
 			i++
 		}
-		if i >= c.NReduce {
+		if i >= c.NReduce || runningReduceJob {
 			reply.TaskType = SCHEDULE
 			c.lock.Unlock()
 			return nil
@@ -94,6 +99,7 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 }
 
 func (c *Coordinator) DoneTask(args *WorkerArgs, reply *WorkerReply) error {
+	fmt.Printf("task [%d]%d done.\n", args.TaskType, args.TaskID)
 	c.lock.Lock()
 	if args.TaskType == MAP {
 		c.MapJobs[args.TaskID] = DONE
