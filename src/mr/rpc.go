@@ -59,3 +59,9 @@ func coordinatorSock() string {
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
+
+func workerSock() string {
+	s := "/var/tmp/824-mr+"
+	s += strconv.Itoa(os.Getuid())
+	return s
+}

@@ -46,7 +46,9 @@ func main() {
 			log.Fatalf("cannot read %v", filename)
 		}
 		file.Close()
+		//fmt.Printf("map %s\n", filename)
 		kva := mapf(filename, string(content))
+		//fmt.Printf("map len:%v\n", len(kva))
 		intermediate = append(intermediate, kva...)
 	}
 
@@ -75,6 +77,7 @@ func main() {
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
+		//fmt.Printf("reduce %v len:%v\n", i, len(values))
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
