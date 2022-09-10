@@ -37,69 +37,47 @@ func (c *Coordinator) EmitJob(args *WorkerArgs, reply *WorkerReply) error {
 	reply.NMAP = c.NMap
 	reply.NReduce = c.NReduce
 	c.lock.Lock()
-	runningMapJob := false
 	if c.DoneMap < c.NMap {
-		i := c.DoneMap
-		for i < c.NMap {
-			if !runningMapJob && c.MapJobs[i] == DONE {
-				c.DoneMap = i + 1
-			} else if c.MapJobs[i] == INIT {
+		for i := 0; i < c.NMap; i++ {
+			if c.MapJobs[i] == INIT {
+				reply.TaskType = MAP
+				reply.TaskID = i
+				reply.Filename = c.Files[i]
 				c.MapJobs[i] = PROCESSING
-				break
-			} else if c.MapJobs[i] == PROCESSING {
-				runningMapJob = true
+				c.lock.Unlock()
+				go c.HeartBeat(reply)
+				return nil
 			}
-			i++
 		}
-		if i >= c.NMap || runningMapJob {
-			reply.TaskType = SCHEDULE
-			c.lock.Unlock()
-			return nil
-		} else {
-			reply.TaskType = MAP
-			reply.TaskID = i
-			reply.Filename = c.Files[i]
-			c.lock.Unlock()
-			go c.HeartBeat(reply)
-			return nil
-		}
+		reply.TaskType = SCHEDULE
+		c.lock.Unlock()
+		return nil
 	} else {
-		i := c.DoneReduce
-		runningReduceJob := false
-		if i == c.NReduce {
+		if c.DoneReduce == c.NReduce {
 			reply.TaskType = FINISH
 			c.lock.Unlock()
 			return nil
 		}
-		for i < c.NReduce {
-			if !runningReduceJob && c.ReduceJobs[i] == DONE {
-				c.DoneReduce = i + 1
-			} else if c.ReduceJobs[i] == INIT {
+		for i := 0; i < c.NReduce; i++ {
+			if c.ReduceJobs[i] == INIT {
+				reply.TaskType = REDUCE
+				reply.TaskID = i
 				c.ReduceJobs[i] = PROCESSING
-				break
-			} else if c.ReduceJobs[i] == PROCESSING {
-				runningReduceJob = true
+				c.lock.Unlock()
+				go c.HeartBeat(reply)
+				return nil
 			}
-			i++
 		}
-		if i >= c.NReduce || runningReduceJob {
-			reply.TaskType = SCHEDULE
-			c.lock.Unlock()
-			return nil
-		} else {
-			reply.TaskType = REDUCE
-			reply.TaskID = i
-			c.lock.Unlock()
-			go c.HeartBeat(reply)
-			return nil
-		}
+		reply.TaskType = SCHEDULE
+		c.lock.Unlock()
+		return nil
 	}
 	c.lock.Unlock()
 	return nil
 }
 
 func (c *Coordinator) DoneTask(args *WorkerArgs, reply *WorkerReply) error {
-	fmt.Printf("task [%d]%d done.\n", args.TaskType, args.TaskID)
+	// fmt.Printf("task [%d]%d done.\n", args.TaskType, args.TaskID)
 	c.lock.Lock()
 	if args.TaskType == MAP {
 		c.MapJobs[args.TaskID] = DONE
@@ -172,18 +150,12 @@ func (c *Coordinator) HeartBeat(reply *WorkerReply) error {
 	case MAP:
 		if c.MapJobs[reply.TaskID] != DONE {
 			c.MapJobs[reply.TaskID] = INIT
-			if c.DoneMap > reply.TaskID {
-				c.DoneMap = reply.TaskID
-			}
 			fmt.Printf("reset MAP task %d INIT, DoneMap = %d\n", reply.TaskID, c.DoneMap)
 		}
 		break
 	case REDUCE:
 		if c.ReduceJobs[reply.TaskID] != DONE {
 			c.ReduceJobs[reply.TaskID] = INIT
-			if c.DoneReduce > reply.TaskID {
-				c.DoneReduce = reply.TaskID
-			}
 			fmt.Printf("reset REDUCE task %d INIT, DoneReduce = %d\n", reply.TaskID, c.DoneReduce)
 		}
 		break

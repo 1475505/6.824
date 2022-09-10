@@ -81,9 +81,9 @@ func Worker(mapf func(string, string) []KeyValue,
 		if !ok {
 			fmt.Printf("RPC Error: cannot ask for job!")
 		}
-		if reply.TaskType != SCHEDULE {
-			fmt.Printf("start job [%d]%d..\n", reply.TaskType, reply.TaskID)
-		}
+		//if reply.TaskType != SCHEDULE {
+		//	fmt.Printf("start job [%d]%d..\n", reply.TaskType, reply.TaskID)
+		//}
 		// read that file and call the application function, as in mrsequential.go
 		switch reply.TaskType {
 		case SCHEDULE:
