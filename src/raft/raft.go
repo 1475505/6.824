@@ -244,7 +244,8 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	// set currentTerm = T, convert to follower
 	term, isLeader := rf.GetState()
 	if args.Term > term || (isLeader && args.Term >= term) { // give up leader because others is
-		DPrintf("%d changed to FOLLOWER due to term %d out-of-date %d", rf.me, term, args.Term)
+		//DPrintf("%d changed to FOLLOWER due to term %d out-of-date %d", rf.me, term, args.Term)
+		Debug(dDrop, "S%d FOLLOWER due to TERM %d out-of-date %d", rf.me, term, args.Term)
 		rf.state = FOLLOWER
 		rf.currentTerm = args.Term
 	}
@@ -342,7 +343,8 @@ func (rf *Raft) startElection() {
 	rf.HeartbeatTime = time.Now()
 	term := rf.currentTerm + 1 // Term may not be the same as the rf.currentTerm at which the surrounding code decided to become a Candidate.
 	rf.mu.Unlock()
-	DPrintf("%d Start an election(for term: %d).", rf.me, term)
+	//DPrintf("%d Start an election(for term: %d).", rf.me, term)
+	Debug(dVote, "S%d CANDIDATE start election(for TERM: %d).", rf.me, term)
 
 	votes := 1 // must vote self, so init 1.
 	votesLock := sync.Mutex{}
@@ -379,13 +381,16 @@ func (rf *Raft) startElection() {
 	for votes <= len(rf.peers)/2 && finish != len(rf.peers) {
 		cond.Wait()
 	}
-	DPrintf("%d's election ends with votes %d.", rf.me, votes)
+	// DPrintf("%d's election ends with votes %d.", rf.me, votes)
+	Debug(dVote, "S%d CANDIDATE election ends(VOTEs:%d).", rf.me, votes)
 	if votes > len(rf.peers)/2 && rf.state == CANDIDATE {
 		rf.mu.Lock()
 		rf.state = LEADER
 		rf.currentTerm++
-		DPrintf("CANDIDATE %d become leader in terms %d", rf.me, rf.currentTerm)
-		rf.Heartbeat() // send initial empty AppendEntries RPCs
+		// DPrintf("CANDIDATE %d become leader in terms %d", rf.me, rf.currentTerm)
+		Debug(dLeader, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
+		time.Sleep(HEARTBEAT_INTERVAL / 5 * time.Millisecond) // maybe bug here
+		rf.Heartbeat()                                        // send initial empty AppendEntries RPCs
 		rf.mu.Unlock()
 		//rf.matchIndex = make([]int, len(rf.peers))
 		//rf.nextIndex = make([]int, len(rf.peers))

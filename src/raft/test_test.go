@@ -31,7 +31,7 @@ func TestInitialElection2A(t *testing.T) {
 
 	// sleep a bit to avoid racing with followers learning of the
 	// election, then check that all peers agree on the term.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(HEARTBEAT_INTERVAL / 2 * time.Millisecond)
 	term1 := cfg.checkTerms()
 	if term1 < 1 {
 		t.Fatalf("term is %v, but should be at least 1", term1)
