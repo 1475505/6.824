@@ -470,7 +470,7 @@ func (cfg *config) checkTerms() int {
 			if term == -1 {
 				term = xterm
 			} else if term != xterm {
-				cfg.t.Fatalf("servers disagree on term([%d]%d : %d", i, xterm, term)
+				cfg.t.Fatalf("servers disagree on term: peer[%d]'s is %d but not %d)", i, xterm, term)
 			}
 		}
 	}
@@ -587,8 +587,10 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
+			var nd int
+			var cmd1 interface{}
 			for time.Since(t1).Seconds() < 2 {
-				nd, cmd1 := cfg.nCommitted(index)
+				nd, cmd1 = cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
@@ -599,7 +601,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
-				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+				cfg.t.Fatalf("one(%v) failed to reach agreement (index %d: %d, %v)", cmd, index, nd, cmd1)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)

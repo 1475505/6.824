@@ -116,7 +116,8 @@ type Raft struct {
 	HeartbeatSentTime time.Time // For LEADER: last time received heartbeat
 	HeartbeatTime     time.Time // For FOLLOWER: last time sent heartbeat to FOLLOWER s
 
-	applyCh chan ApplyMsg
+	applyCh   chan ApplyMsg
+	applyCond *sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -217,14 +218,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = FOLLOWER
+		rf.HeartbeatTime = time.Now()
+	}
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
-	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = FOLLOWER
 	}
 	LastLogIndex := len(rf.log) - 1
 	LastLogTerm := rf.log[len(rf.log)-1].Term
@@ -303,8 +305,8 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		}
 	}
 	reply.Success = true
-	Debug(dInfo, "S%d<-S%d received Heartbeat term %d with %d logs, reply %t",
-		rf.me, args.LeaderId, args.Term, len(args.Entries), reply.Success)
+	Debug(dInfo, "S%d<-S%d received Heartbeat term %d with %d logs(prevLog:%d -> ends logs:%d), reply %t",
+		rf.me, args.LeaderId, args.Term, len(args.Entries), args.PrevLogIndex, len(rf.log)-1, reply.Success)
 }
 
 //
@@ -372,7 +374,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	logEntry := LogEntry{Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, logEntry)
-	return index, term, isLeader
+	Debug(dLeader, "S%d LEADER got a log command %v, now have %d logs", rf.me, command, len(rf.log))
+	return len(rf.log) - 1, term, isLeader
 }
 
 //
@@ -444,13 +447,15 @@ func (rf *Raft) startElection() {
 	// DPrintf("%d's election ends with votes %d.", rf.me, votes)
 	Debug(dVote, "S%d CANDIDATE election ends(VOTEs:%d).", rf.me, votes)
 	if votes > len(rf.peers)/2 && rf.state == CANDIDATE {
-		rf.Heartbeat() // send initial empty AppendEntries RPCs
+		time.Sleep(20 * time.Millisecond) // Not to lock so early, make heartbeat process
 		rf.mu.Lock()
-		rf.state = LEADER
 		rf.currentTerm++
+		rf.state = LEADER
+		rf.mu.Unlock()
+		rf.Heartbeat() // send initial empty AppendEntries RPCs
 		// DPrintf("CANDIDATE %d become leader in terms %d", rf.me, rf.currentTerm)
 		Debug(dLeader, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
-		time.Sleep(HEARTBEAT_INTERVAL / 5 * time.Millisecond) // maybe bug here
+		rf.mu.Lock()
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIndex[i] = len(rf.log)
 			rf.matchIndex[i] = 0
@@ -487,6 +492,7 @@ func (rf *Raft) ticker() {
 			}
 			go rf.Heartbeat()
 		}
+		go rf.Apply2StateMachine()
 		time.Sleep(HEARTBEAT_INTERVAL * time.Millisecond)
 	}
 }
@@ -495,7 +501,7 @@ func (rf *Raft) Heartbeat() {
 	rf.mu.Lock()
 	rf.HeartbeatSentTime = time.Now()
 	// no need to : var wg sync.WaitGroup
-	if rf.killed() || rf.state != LEADER {
+	if rf.state != LEADER {
 		rf.state = FOLLOWER
 		rf.mu.Unlock()
 		return
@@ -512,8 +518,9 @@ func (rf *Raft) Heartbeat() {
 			continue
 		}
 		go func(i int) {
-			Debug(dTrace, "S%d->S%d LEADER [term %d]send heartbeat with PrevLogIndex %d, to %d",
+			Debug(dTrace, "S%d->S%d LEADER(term %d) send heartbeat with PrevLogIndex %d, to %d",
 				rf.me, i, rf.currentTerm, rf.nextIndex[i]-1, endIdx)
+			rf.mu.Lock()
 			appendEntries := &AppendEntries{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -522,6 +529,7 @@ func (rf *Raft) Heartbeat() {
 				Entries:      rf.log[rf.nextIndex[i]:],
 				LeaderCommit: rf.commitIndex,
 			}
+			rf.mu.Unlock()
 			heartbeatReply := &HeartbeatReply{Success: false}
 			succ := rf.sendHeartbeat(i, appendEntries, heartbeatReply)
 			if !succ {
@@ -533,14 +541,14 @@ func (rf *Raft) Heartbeat() {
 				votes++
 				votesLock.Unlock()
 				rf.mu.Lock()
-				rf.nextIndex[i] = endIdx
-				rf.matchIndex[i] = endIdx - 1
+				rf.nextIndex[i] = endIdx + 1
+				rf.matchIndex[i] = endIdx
 				rf.mu.Unlock()
 			}
 			Debug(dVote, "S%d<-S%d LEADER heartbeat reply(%t), set its nextIdx=%d, matchIdx=%d",
 				rf.me, i, heartbeatReply.Success, rf.nextIndex[i], rf.matchIndex[i])
-			cond.Broadcast()
 			finish++
+			cond.Broadcast()
 		}(i)
 	}
 	votesLock.Lock()
@@ -550,20 +558,34 @@ func (rf *Raft) Heartbeat() {
 	Debug(dVote, "S%d LEADER AppendEntry ends(VOTEs:%d).", rf.me, votes)
 	rf.mu.Lock()
 	if votes > len(rf.peers)/2 && rf.state == LEADER {
+		rf.commitIndex = endIdx
+		Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, commitIndex:%d).", rf.me, rf.currentTerm, rf.commitIndex)
 		// 当领导者将日志项成功复制至集群大多数节点的时候，日志项处于 committed 状态，领导者可将这个日志项应用（apply）到自己的状态机中
-		rf.commitIndex = endIdx - 1
-		Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, lastApplied:%d).", rf.me, rf.currentTerm, rf.commitIndex)
-		//applyMsg := ApplyMsg{
-		//	Command:      rf.log[rf.commitIndex].Command,
-		//	CommandIndex: rf.commitIndex,
-		//	CommandValid: true,
-		//}
-		//rf.applyCh <- applyMsg
-		rf.lastApplied = endIdx - 1
-		Debug(dCommit, "S%d LEADER AppendEntry applys(TERM:%d, lastApplied:%d).", rf.me, rf.currentTerm, rf.lastApplied)
+		if rf.commitIndex > rf.lastApplied {
+			applyMsg := ApplyMsg{
+				Command:      rf.log[rf.commitIndex].Command,
+				CommandIndex: rf.commitIndex,
+				CommandValid: true,
+			}
+			rf.applyCh <- applyMsg
+			rf.lastApplied = rf.commitIndex
+		}
+		Debug(dCommit, "S%d LEADER AppendEntry applys(TERM:%d, lastApplied->%d).", rf.me, rf.currentTerm, rf.lastApplied)
 	}
 	rf.mu.Unlock()
 	votesLock.Unlock()
+}
+
+func (rf *Raft) Apply2StateMachine() {
+	if rf.commitIndex > rf.lastApplied {
+		applyMsg := ApplyMsg{
+			Command:      rf.log[rf.commitIndex].Command,
+			CommandIndex: rf.commitIndex,
+			CommandValid: true,
+		}
+		rf.applyCh <- applyMsg
+		rf.lastApplied = rf.commitIndex
+	}
 }
 
 //
@@ -585,6 +607,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = 0
@@ -595,8 +618,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = 1
 	}
 	rf.log = make([]LogEntry, 1)
-	rf.log = append(rf.log, LogEntry{Term: 0}) // a naive item to make idx start from 1.
-	rf.state = FOLLOWER                        // When servers start up, they begin as followers.
+	//rf.log = append(rf.log, LogEntry{Term: 0}) // a naive item to make idx start from 1.
+	rf.state = FOLLOWER // When servers start up, they begin as followers.
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
