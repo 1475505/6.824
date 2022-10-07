@@ -560,31 +560,24 @@ func (rf *Raft) Heartbeat() {
 	if votes > len(rf.peers)/2 && rf.state == LEADER {
 		rf.commitIndex = endIdx
 		Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, commitIndex:%d).", rf.me, rf.currentTerm, rf.commitIndex)
-		// 当领导者将日志项成功复制至集群大多数节点的时候，日志项处于 committed 状态，领导者可将这个日志项应用（apply）到自己的状态机中
-		if rf.commitIndex > rf.lastApplied {
-			applyMsg := ApplyMsg{
-				Command:      rf.log[rf.commitIndex].Command,
-				CommandIndex: rf.commitIndex,
-				CommandValid: true,
-			}
-			rf.applyCh <- applyMsg
-			rf.lastApplied = rf.commitIndex
-		}
-		Debug(dCommit, "S%d LEADER AppendEntry applys(TERM:%d, lastApplied->%d).", rf.me, rf.currentTerm, rf.lastApplied)
 	}
 	rf.mu.Unlock()
 	votesLock.Unlock()
 }
 
 func (rf *Raft) Apply2StateMachine() {
-	if rf.commitIndex > rf.lastApplied {
+	for rf.commitIndex > rf.lastApplied {
+		applyIdx := rf.lastApplied + 1
 		applyMsg := ApplyMsg{
-			Command:      rf.log[rf.commitIndex].Command,
-			CommandIndex: rf.commitIndex,
+			Command:      rf.log[applyIdx].Command,
+			CommandIndex: applyIdx,
 			CommandValid: true,
 		}
 		rf.applyCh <- applyMsg
-		rf.lastApplied = rf.commitIndex
+		rf.lastApplied = applyIdx
+		// 当领导者将日志项成功复制至集群大多数节点的时候，日志项处于 committed 状态，领导者可将这个日志项应用（apply）到自己的状态机中
+		Debug(dLog2, "S%d applys(TERM:%d, lastApplied->%d) command %v.",
+			rf.me, rf.currentTerm, rf.lastApplied, rf.log[rf.commitIndex].Command)
 	}
 }
 

@@ -65,6 +65,8 @@ def main(
 
     panic = False
     for line in input_:
+        if "error" in line or ".go:" in line:
+            print(line, end="")
         try:
             time, topic, *msg = line.strip().split(" ")
             # To ignore some topics
