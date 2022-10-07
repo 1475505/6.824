@@ -229,7 +229,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	LastLogIndex := len(rf.log) - 1
-	LastLogTerm := rf.log[len(rf.log)-1].Term
+	LastLogTerm := rf.log[LastLogIndex].Term
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && args.LastLogTerm >= LastLogTerm &&
 		args.LastLogIndex >= LastLogIndex {
 		reply.VoteGranted = true
@@ -247,6 +247,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower
 	term, _ := rf.GetState()
+	reply.Term = term
 	if args.Term > term || (rf.state != FOLLOWER && args.Term == term) { // give up leader because others is
 		//DPrintf("%d changed to FOLLOWER due to term %d out-of-date %d", rf.me, term, args.Term)
 		Debug(dDrop, "S%d FOLLOWER due to TERM %d out-of-date %d", rf.me, term, args.Term)
@@ -254,11 +255,11 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		rf.currentTerm = args.Term
 	}
 	if args.Term < rf.currentTerm { //outdated leader
+		Debug(dDrop, "S%d FOLLOWER heartbeat from outdated TERM %d - %d, discard", rf.me, args.Term, term)
 		reply.Success = false
 		return
 	}
 	rf.HeartbeatTime = time.Now()
-	reply.Term = term
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
@@ -269,7 +270,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		Debug(dError, "S%d<-%d FOLLOWER heartbeat mismatch PrevLogTerm, actual %d, given %d, prevLogIndex: %d(with %d logs)",
-			rf.me, args.LeaderId, args.Term, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, len(args.Entries))
+			rf.me, args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, args.PrevLogIndex, len(args.Entries))
 		return
 	}
 
@@ -372,6 +373,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return index, term, isLeader
 	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	logEntry := LogEntry{Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, logEntry)
 	Debug(dLeader, "S%d LEADER got a log command %v, now have %d logs", rf.me, command, len(rf.log))
@@ -447,7 +450,7 @@ func (rf *Raft) startElection() {
 	// DPrintf("%d's election ends with votes %d.", rf.me, votes)
 	Debug(dVote, "S%d CANDIDATE election ends(VOTEs:%d).", rf.me, votes)
 	if votes > len(rf.peers)/2 && rf.state == CANDIDATE {
-		time.Sleep(20 * time.Millisecond) // Not to lock so early, make heartbeat process
+		time.Sleep(20 * time.Millisecond) // Not to lock so early, make heartbeat work
 		rf.mu.Lock()
 		rf.currentTerm++
 		rf.state = LEADER
@@ -459,6 +462,7 @@ func (rf *Raft) startElection() {
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIndex[i] = len(rf.log)
 			rf.matchIndex[i] = 0
+			rf.votedFor = -1
 		}
 		rf.mu.Unlock()
 	} else {
@@ -520,33 +524,48 @@ func (rf *Raft) Heartbeat() {
 		go func(i int) {
 			Debug(dTrace, "S%d->S%d LEADER(term %d) send heartbeat with PrevLogIndex %d, to %d",
 				rf.me, i, rf.currentTerm, rf.nextIndex[i]-1, endIdx)
-			rf.mu.Lock()
+			heartbeatReply := &HeartbeatReply{Term: -1, Success: false}
 			appendEntries := &AppendEntries{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
-				PrevLogIndex: rf.nextIndex[i] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+				PrevLogIndex: rf.matchIndex[i],
+				PrevLogTerm:  rf.log[rf.matchIndex[i]].Term,
 				Entries:      rf.log[rf.nextIndex[i]:],
 				LeaderCommit: rf.commitIndex,
 			}
-			rf.mu.Unlock()
-			heartbeatReply := &HeartbeatReply{Success: false}
-			succ := rf.sendHeartbeat(i, appendEntries, heartbeatReply)
-			if !succ {
+			rf.sendHeartbeat(i, appendEntries, heartbeatReply)
+			for !heartbeatReply.Success {
+				// appendEntries.PrevLogIndex = rf.matchIndex[i]
+				// appendEntries.PrevLogTerm = rf.log[rf.matchIndex[i]].Term
+				if heartbeatReply.Term != rf.currentTerm {
+					Debug(dVote, "S%d<-S%d LEADER heartbeat reply term(%d) mismatch or no response, nextIdx=%d, PrevLogTerm %d",
+						rf.me, i, heartbeatReply.Term, rf.nextIndex[i], appendEntries.PrevLogTerm)
+					break
+				}
+				appendEntries.PrevLogIndex = rf.nextIndex[i] - 1
+				appendEntries.PrevLogTerm = rf.log[rf.nextIndex[i]-1].Term
+				appendEntries.Entries = rf.log[rf.nextIndex[i]:]
+				rf.mu.Lock()
+				if rf.nextIndex[i] >= rf.commitIndex {
+					rf.nextIndex[i]--
+				}
+				rf.mu.Unlock()
 				rf.sendHeartbeat(i, appendEntries, heartbeatReply)
-			} // just a retry. Maybe no need?
+				Debug(dVote, "S%d<-S%d LEADER heartbeat reply(%t), retry with nextIdx=%d, PrevLogTerm %d",
+					rf.me, i, heartbeatReply.Success, rf.nextIndex[i], appendEntries.PrevLogTerm)
+			}
 			if heartbeatReply.Success {
 				// If successful: update nextIndex and matchIndex for follower (§5.3)
 				votesLock.Lock()
 				votes++
 				votesLock.Unlock()
 				rf.mu.Lock()
-				rf.nextIndex[i] = endIdx + 1
-				rf.matchIndex[i] = endIdx
+				rf.nextIndex[i] = appendEntries.PrevLogIndex + len(appendEntries.Entries) + 1
+				rf.matchIndex[i] = appendEntries.PrevLogIndex + len(appendEntries.Entries)
 				rf.mu.Unlock()
+				Debug(dVote, "S%d<-S%d LEADER heartbeat reply(%t), set its nextIdx=%d, matchIdx=%d",
+					rf.me, i, heartbeatReply.Success, rf.nextIndex[i], rf.matchIndex[i])
 			}
-			Debug(dVote, "S%d<-S%d LEADER heartbeat reply(%t), set its nextIdx=%d, matchIdx=%d",
-				rf.me, i, heartbeatReply.Success, rf.nextIndex[i], rf.matchIndex[i])
 			finish++
 			cond.Broadcast()
 		}(i)
@@ -558,14 +577,18 @@ func (rf *Raft) Heartbeat() {
 	Debug(dVote, "S%d LEADER AppendEntry ends(VOTEs:%d).", rf.me, votes)
 	rf.mu.Lock()
 	if votes > len(rf.peers)/2 && rf.state == LEADER {
-		rf.commitIndex = endIdx
-		Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, commitIndex:%d).", rf.me, rf.currentTerm, rf.commitIndex)
+		if endIdx != rf.commitIndex {
+			rf.commitIndex = endIdx
+			Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, commitIndex:%d).", rf.me, rf.currentTerm, rf.commitIndex)
+		}
 	}
 	rf.mu.Unlock()
 	votesLock.Unlock()
 }
 
 func (rf *Raft) Apply2StateMachine() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for rf.commitIndex > rf.lastApplied {
 		applyIdx := rf.lastApplied + 1
 		applyMsg := ApplyMsg{
@@ -573,11 +596,13 @@ func (rf *Raft) Apply2StateMachine() {
 			CommandIndex: applyIdx,
 			CommandValid: true,
 		}
+		rf.mu.Unlock()
 		rf.applyCh <- applyMsg
+		rf.mu.Lock()
 		rf.lastApplied = applyIdx
 		// 当领导者将日志项成功复制至集群大多数节点的时候，日志项处于 committed 状态，领导者可将这个日志项应用（apply）到自己的状态机中
 		Debug(dLog2, "S%d applys(TERM:%d, lastApplied->%d) command %v.",
-			rf.me, rf.currentTerm, rf.lastApplied, rf.log[rf.commitIndex].Command)
+			rf.me, rf.currentTerm, rf.lastApplied, rf.log[applyIdx].Command)
 	}
 }
 

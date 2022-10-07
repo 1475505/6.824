@@ -416,7 +416,7 @@ loop:
 			if ix, ok := cmd.(int); ok {
 				if ix == -1 {
 					// peers have moved on to later terms
-					// so we can't expect all Start()s to
+					// ,so we can't expect all Start()s to
 					// have succeeded
 					failed = true
 					break
@@ -445,7 +445,7 @@ loop:
 				}
 			}
 			if ok == false {
-				t.Fatalf("cmd %v missing in %v", x, cmds)
+				t.Fatalf("(false in iter %d) cmd %v missing in %v", ii, x, cmds)
 			}
 		}
 
