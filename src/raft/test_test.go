@@ -479,7 +479,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg.rafts[leader1].Start(104)
 
 	// new leader commits, also for index=2
-	cfg.one(103, 2, true)
+	cfg.one(103, 2, true) //103->leader2
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
