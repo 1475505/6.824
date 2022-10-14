@@ -123,6 +123,7 @@ func TestManyElections2A(t *testing.T) {
 	cfg.end()
 }
 
+//expected: [_, 100, 200, 300]
 func TestBasicAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -308,6 +309,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.end()
 }
 
+//expected: [10, 20, 30, 1000] Remember Logs index starts from 1.
 func TestFailNoAgree2B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -460,6 +462,8 @@ loop:
 	cfg.end()
 }
 
+// [101] -> disconnect leader1（102-104） -> 103 -> disconnect leader2, connect leader1 -> 104 -> connect leader2 -> 105
+// expected: [_, 101, 103, 104, 105]
 func TestRejoin2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
