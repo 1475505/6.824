@@ -66,8 +66,8 @@ type LogEntry struct {
 }
 
 const ( // metric: ms
-	ELECTION_TIMEWAIT_LOW  = 1000
-	ELECTION_TIMEWAIT_HIGH = 2000
+	ELECTION_TIMEWAIT_LOW  = 500
+	ELECTION_TIMEWAIT_HIGH = 1000
 	HEARTBEAT_INTERVAL     = 100
 )
 
@@ -268,8 +268,11 @@ func (rf *Raft) becomeCandidate(pre bool) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// UP_TO_DATE restriction
+	Debug(dVote, "S%d(%d)<-%d received vote request for term %d ", rf.me, rf.state, args.CandidateID, args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	Debug(dVote, "S%d(%d)<-%d processing received vote request for term %d", rf.me, rf.state, args.CandidateID, args.Term)
+
 	term, isLeader := rf.GetState()
 	if args.Term > term && isLeader {
 		Debug(dDrop, "S%d FOLLOWER due to TERM %d out-of-date %d", rf.me, rf.currentTerm, args.Term)
@@ -334,12 +337,12 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		rf.mu.Unlock()
 		return
 	}
-	rf.mu.Unlock()
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
 		Debug(dError, "S%d<-%d FOLLOWER heartbeat PrevLogIndex %d, exceeds len(logs) %d(with %d logs)",
 			rf.me, args.LeaderId, args.PrevLogIndex, len(rf.log), len(args.Entries))
+		rf.mu.Unlock()
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -347,6 +350,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 			rf.me, args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, args.PrevLogIndex, len(args.Entries))
 		reply.Success = false
 		rf.log = rf.log[:args.PrevLogIndex]
+		rf.mu.Unlock()
 		return
 	}
 	// If an existing entry conflicts with a new one (same index but different terms),
@@ -358,6 +362,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	}
 	endIdx := len(rf.log) - 1
+	rf.mu.Unlock()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = minInt(args.LeaderCommit, endIdx)
 		go rf.Apply2StateMachine()
@@ -491,9 +496,12 @@ func (rf *Raft) startElection() {
 		go func(i int) {
 			requestVoteReply := &RequestVoteReply{}
 			ok := rf.sendRequestVote(i, requestVoteArgs, requestVoteReply)
+			Debug(dVote, "S%d(%d)->%d send vote request ", rf.me, rf.state, i)
 			if ok {
 				if requestVoteReply.Term > term {
 					rf.becomeFollower(requestVoteReply.Term)
+					cond.Broadcast()
+					finish++
 					return
 				}
 				// DPrintf("Request vote(%t) %d/%d by candidate %d.", requestVoteReply.VoteGranted, i, len(rf.peers), rf.me)
@@ -515,7 +523,7 @@ func (rf *Raft) startElection() {
 	if votes > len(rf.peers)/2 {
 		Debug(dVote, "S%d CANDIDATE(%d) election success(VOTEs:%d).", rf.me, rf.state, votes)
 		if rf.state == CANDIDATE {
-			Debug(dLeader, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
+			Debug(dLog, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
 			// When a leader first comes to power,
 			// it initializes all nextIndex values to the index just after the last one in its log (11 in Figure 7).
 			rf.mu.Lock()
@@ -525,19 +533,20 @@ func (rf *Raft) startElection() {
 			}
 			rf.state = LEADER
 			rf.mu.Unlock()
-			rf.Heartbeat() // send initial empty AppendEntries RPCs
+			go rf.Heartbeat() // send initial empty AppendEntries RPCs
 		} else if rf.state == PRE_CANDIDATE {
 			rf.becomeCandidate(false)
-			rf.startElection()
+			defer rf.startElection()
 		}
 	} else {
 		Debug(dVote, "S%d CANDIDATE(%d) election failed.(VOTEs:%d).", rf.me, rf.state, votes)
 		rf.becomeFollower(rf.currentTerm)
 	}
+	votesLock.Unlock()
 	if rf.state == FOLLOWER {
 		rf.votedFor = -1
 	}
-	votesLock.Unlock()
+
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -590,9 +599,9 @@ func (rf *Raft) buildHeartbeatInfo(peer int) *AppendEntries {
 func (rf *Raft) Heartbeat() {
 	// no need to : var wg sync.WaitGroup
 	rf.mu.Lock()
-	term, _ := rf.GetState()
+	term, isLeader := rf.GetState()
 	rf.mu.Unlock()
-	if rf.state != LEADER {
+	if !isLeader {
 		return
 	}
 	rf.HeartbeatSentTime = time.Now()
@@ -631,7 +640,7 @@ func (rf *Raft) Heartbeat() {
 						rf.me, i, rf.currentTerm)
 					break
 				} else if heartbeatReply.Term < term {
-					Debug(dVote, "S%d<-S%d LEADER heartbeat reply term(%d) mismatch, nextIdx=%d, PrevLogTerm %d",
+					Debug(dLeader, "S%d<-S%d LEADER heartbeat reply term(%d) mismatch, nextIdx=%d, PrevLogTerm %d",
 						rf.me, i, term, rf.nextIndex[i], appendEntries.PrevLogTerm)
 					break
 				}
@@ -641,7 +650,7 @@ func (rf *Raft) Heartbeat() {
 				}
 				rf.mu.Unlock()
 				appendEntries = rf.buildHeartbeatInfo(i)
-				Debug(dVote, "S%d<-S%d LEADER heartbeat reply(%t), retry with nextIdx=%d, PrevLogTerm %d",
+				Debug(dLeader, "S%d<-S%d LEADER heartbeat reply(%t), retry with nextIdx=%d, PrevLogTerm %d",
 					rf.me, i, heartbeatReply.Success, rf.nextIndex[i], appendEntries.PrevLogTerm)
 				heartbeatReply = &HeartbeatReply{}
 				ok = rf.sendHeartbeat(i, appendEntries, heartbeatReply)
@@ -656,7 +665,7 @@ func (rf *Raft) Heartbeat() {
 				rf.matchIndex[i] = appendEntries.PrevLogIndex + len(appendEntries.Entries)
 				rf.nextIndex[i] = len(rf.log)
 				rf.mu.Unlock()
-				Debug(dVote, "S%d<-S%d LEADER heartbeat reply(%t), set its nextIdx=%d, matchIdx=%d",
+				Debug(dLeader, "S%d<-S%d LEADER heartbeat reply(%t), set its nextIdx=%d, matchIdx=%d",
 					rf.me, i, heartbeatReply.Success, rf.nextIndex[i], rf.matchIndex[i])
 			}
 			finish++
@@ -667,8 +676,13 @@ func (rf *Raft) Heartbeat() {
 	for votes <= len(rf.peers)/2 && finish != len(rf.peers) {
 		cond.Wait()
 	}
-	Debug(dVote, "S%d LEADER AppendEntry ends(VOTEs:%d).", rf.me, votes)
-	if votes > len(rf.peers)/2 && rf.state == LEADER {
+	if rf.state != LEADER {
+		finish++
+		cond.Broadcast()
+		return
+	}
+	Debug(dLeader, "S%d(%d) AppendEntry ends(VOTEs:%d).", rf.me, rf.state, votes)
+	if votes > len(rf.peers)/2 {
 		if endIdx != rf.commitIndex {
 			rf.commitIndex = endIdx
 			Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, commitIndex:%d).", rf.me, rf.currentTerm, rf.commitIndex)

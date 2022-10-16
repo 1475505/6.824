@@ -50,6 +50,8 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.end()
 }
 
+// leader1 -> disconnect leader1 -> leader2 -> disconnect leader2, leader2 + 1
+// -> sleep 2 election TO -> connect leader2 + 1 -> connect leader 2
 func TestReElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
