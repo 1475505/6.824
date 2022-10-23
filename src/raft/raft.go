@@ -508,19 +508,20 @@ func (rf *Raft) startElection() {
 					rf.mu.Lock()
 					rf.becomeFollower(requestVoteReply.Term)
 					rf.mu.Unlock()
-					cond.Broadcast()
 					finish++
+					cond.Broadcast()
 					return
 				}
 				// DPrintf("Request vote(%t) %d/%d by candidate %d.", requestVoteReply.VoteGranted, i, len(rf.peers), rf.me)
 				votesLock.Lock()
 				if requestVoteReply.VoteGranted {
 					TrueVotes++
+					cond.Broadcast()
 				}
 				votesLock.Unlock()
 			}
-			cond.Broadcast()
 			finish++
+			cond.Broadcast()
 		}(i)
 	}
 	votesLock.Lock()
