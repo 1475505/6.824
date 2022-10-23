@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"github.com/sasha-s/go-deadlock"
 	"math/rand"
 	//	"bytes"
@@ -91,6 +93,8 @@ type AppendEntries struct {
 type HeartbeatReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	XIndex  int
+	XTerm   int
 }
 
 //
@@ -176,6 +180,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -198,6 +209,18 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -250,6 +273,7 @@ func (rf *Raft) becomeFollower(term int) {
 		rf.votedFor = -1
 	}
 	rf.currentTerm = term
+	rf.persist()
 }
 
 func (rf *Raft) becomeCandidate(pre bool) {
@@ -262,6 +286,7 @@ func (rf *Raft) becomeCandidate(pre bool) {
 		rf.votedFor = rf.me
 		rf.currentTerm++
 	}
+	rf.persist()
 	rf.mu.Unlock()
 }
 
@@ -314,6 +339,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.HeartbeatTime = time.Now()
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateID
+	rf.persist()
 	Debug(dVote, "S%d(%d)->%d vote True", rf.me, rf.state, args.CandidateID)
 	return
 }
@@ -347,6 +373,8 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		reply.Success = false
 		Debug(dError, "S%d<-%d FOLLOWER heartbeat PrevLogIndex %d, exceeds len(logs) %d(with %d logs)",
 			rf.me, args.LeaderId, args.PrevLogIndex, len(rf.log), len(args.Entries))
+		reply.XIndex = len(rf.log)
+		reply.XTerm = -1
 		rf.mu.Unlock()
 		return
 	}
@@ -354,7 +382,14 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		Debug(dError, "S%d<-%d FOLLOWER heartbeat mismatch PrevLogTerm, actual %d, given %d, prevLogIndex: %d(with %d logs)",
 			rf.me, args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, args.PrevLogIndex, len(args.Entries))
 		reply.Success = false
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		firstIdx := args.PrevLogIndex
+		for firstIdx > 0 && rf.log[firstIdx-1].Term == args.PrevLogIndex {
+			firstIdx--
+		}
+		reply.XIndex = firstIdx
 		rf.log = rf.log[:args.PrevLogIndex]
+		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
@@ -366,6 +401,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	if len(args.Entries) > 0 {
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	}
+	rf.persist()
 	endIdx := len(rf.log) - 1
 	rf.mu.Unlock()
 	if args.LeaderCommit > rf.commitIndex {
@@ -444,6 +480,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	logEntry := LogEntry{Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, logEntry)
+	rf.persist()
 	Debug(dLeader, "S%d LEADER got a log command %v（Entry Term %d), now have %d logs",
 		rf.me, command, logEntry.Term, len(rf.log))
 	return len(rf.log) - 1, term, isLeader
@@ -554,6 +591,7 @@ func (rf *Raft) startElection() {
 	votesLock.Unlock()
 	if rf.state == FOLLOWER {
 		rf.votedFor = -1
+		rf.persist()
 	}
 }
 
@@ -651,8 +689,14 @@ func (rf *Raft) Heartbeat() {
 					break
 				}
 				rf.mu.Lock()
-				if rf.nextIndex[i] > 1 {
-					rf.nextIndex[i]--
+				firstIdx := appendEntries.PrevLogIndex
+				for firstIdx > 0 && rf.log[firstIdx-1].Term == heartbeatReply.XTerm {
+					firstIdx--
+				}
+				if firstIdx == 0 || rf.log[firstIdx].Term != heartbeatReply.XTerm {
+					rf.nextIndex[i] = heartbeatReply.XIndex
+				} else {
+					rf.nextIndex[i] = firstIdx
 				}
 				rf.mu.Unlock()
 				appendEntries = rf.buildHeartbeatInfo(i)
