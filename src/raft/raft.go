@@ -66,8 +66,8 @@ type LogEntry struct {
 }
 
 const ( // metric: ms
-	ELECTION_TIMEWAIT_LOW  = 500
-	ELECTION_TIMEWAIT_HIGH = 1000
+	ELECTION_TIMEWAIT_LOW  = 300
+	ELECTION_TIMEWAIT_HIGH = 800
 	HEARTBEAT_INTERVAL     = 100
 )
 
@@ -80,17 +80,17 @@ const (
 )
 
 type AppendEntries struct {
-	Term         int        //leader’s term
-	LeaderId     int        //so follower can redirect clients
+	Term         int        // leader’s term
+	LeaderId     int        // so follower can redirect clients
 	PrevLogIndex int        // index of log entry immediately preceding new ones
-	PrevLogTerm  int        //term of prevLogIndex entry
-	Entries      []LogEntry //log entries to store (empty for heartbeat; may send more than one for efficiency)
-	LeaderCommit int        //leader’s commitIndex
+	PrevLogTerm  int        // term of prevLogIndex entry
+	Entries      []LogEntry // log entries to store (empty for heartbeat; may send more than one for efficiency)
+	LeaderCommit int        // leader’s commitIndex
 }
 
 type HeartbeatReply struct {
-	Term    int  //currentTerm, for leader to update itself
-	Success bool //true if follower contained entry matching prevLogIndex and prevLogTerm
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
 //
@@ -109,9 +109,9 @@ type Raft struct {
 
 	// Persistent state on all servers:
 	// (Updated on stable storage before responding to RPCs)
-	currentTerm int        //latest term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor    int        //candidateId that received vote in current term (or -1 if none)
-	log         []LogEntry //log entries;
+	currentTerm int        // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int        // candidateId that received vote in current term (or -1 if none)
+	log         []LogEntry // log entries;
 	state       int
 	// Volatile state on all servers
 	commitIndex int //index of the highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -136,6 +136,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
 	isleader = (rf.state == LEADER)
 	return term, isleader
@@ -243,6 +245,7 @@ type RequestVoteReply struct {
 func (rf *Raft) becomeFollower(term int) {
 	rf.state = FOLLOWER
 	rf.HeartbeatTime = time.Now()
+	// Each server will vote for at most one candidate in a given term
 	if term >= rf.currentTerm {
 		rf.votedFor = -1
 	}
@@ -268,56 +271,58 @@ func (rf *Raft) becomeCandidate(pre bool) {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// UP_TO_DATE restriction
-	Debug(dVote, "S%d(%d)<-%d received vote request for term %d ", rf.me, rf.state, args.CandidateID, args.Term)
+	Debug(dVote, "S%d(%d)<-%d processing received vote request for term %d", rf.me, rf.state, args.CandidateID, args.Term)
+	term, isLeader := rf.GetState()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debug(dVote, "S%d(%d)<-%d processing received vote request for term %d", rf.me, rf.state, args.CandidateID, args.Term)
-
-	term, isLeader := rf.GetState()
-	if args.Term > term && isLeader {
-		Debug(dDrop, "S%d FOLLOWER due to TERM %d out-of-date %d", rf.me, rf.currentTerm, args.Term)
-		rf.becomeFollower(args.Term)
-	}
 	reply.Term = term
 	if args.Term < term && args.LastLogIndex != 0 {
 		reply.VoteGranted = false
 		Debug(dVote, "S%d->%d vote False due to TERM %d ahead of %d", rf.me, args.CandidateID, rf.currentTerm, args.Term)
 		return
 	}
-	LastLogIndex := len(rf.log) - 1
-	LastLogTerm := rf.log[LastLogIndex].Term
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
-		if args.LastLogTerm < LastLogTerm {
-			reply.VoteGranted = false
-			Debug(dVote, "S%d->%d FOLLOWER vote False LastLogTERM %d not up-to-date with %d",
-				rf.me, args.CandidateID, LastLogTerm, args.LastLogTerm)
-			return
-		} else if rf.log[LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex < LastLogIndex {
-			reply.VoteGranted = false
-			Debug(dVote, "S%d->%d FOLLOWER vote False LastLogIndex %d not up-to-date with %d",
-				rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
-			return
-		} else if isLeader && rf.log[LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex == LastLogIndex {
-			reply.VoteGranted = false
-			Debug(dVote, "S%d->%d FOLLOWER vote False LastLogIndex %d not up-to-date with %d",
-				rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
-			return
-		}
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateID
-		Debug(dVote, "S%d->%d FOLLOWER vote True", rf.me, args.CandidateID)
+	if args.Term == term && rf.votedFor != -1 && rf.votedFor != args.CandidateID {
+		reply.VoteGranted = false
+		Debug(dVote, "S%d->%d vote False due to votedFor %d not %d", rf.me, args.CandidateID, rf.votedFor, args.CandidateID)
 		return
 	}
-	reply.VoteGranted = false
-	rf.votedFor = -1
+	if args.Term > term {
+		Debug(dDrop, "S%d(%d) to FOLLOWER due to TERM %d out-of-date %d", rf.me, rf.state, rf.currentTerm, args.Term)
+		rf.becomeFollower(args.Term)
+	}
+
+	LastLogIndex := len(rf.log) - 1
+	LastLogTerm := rf.log[LastLogIndex].Term
+	Debug(dVote, "S%d(%d)<-%d checked term for vote request for term %d", rf.me, rf.state, args.CandidateID, args.Term)
+	if args.LastLogTerm < LastLogTerm {
+		reply.VoteGranted = false
+		Debug(dVote, "S%d->%d FOLLOWER vote False LastLogTERM %d not up-to-date with %d",
+			rf.me, args.CandidateID, LastLogTerm, args.LastLogTerm)
+		return
+	} else if rf.log[LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex < LastLogIndex {
+		reply.VoteGranted = false
+		Debug(dVote, "S%d->%d FOLLOWER vote False LastLogIndex %d not up-to-date with %d",
+			rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
+		return
+	} else if isLeader && rf.log[LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex == LastLogIndex {
+		reply.VoteGranted = false
+		Debug(dVote, "S%d->%d FOLLOWER vote False LastLogIndex %d not up-to-date with %d",
+			rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
+		return
+	}
+
+	rf.HeartbeatTime = time.Now()
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateID
+	Debug(dVote, "S%d(%d)->%d vote True", rf.me, rf.state, args.CandidateID)
 	return
 }
 
 func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
-	rf.mu.Lock()
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower
 	term, isLeader := rf.GetState()
+	rf.mu.Lock()
 	rf.HeartbeatTime = time.Now()
 	reply.Term = term
 	if args.Term < term { //outdated leader
@@ -473,18 +478,18 @@ func (rf *Raft) startElection() {
 	if rf.state == PRE_CANDIDATE {
 		term++
 	}
+	rf.mu.Unlock()
 	requestVoteArgs := &RequestVoteArgs{
 		Term:         term,
 		CandidateID:  rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	rf.mu.Unlock()
 	//DPrintf("%d Start an election(for term: %d).", rf.me, term)
 	Debug(dVote, "S%d(%d) start election(for TERM: %d) with LastLogTerm %d.",
 		rf.me, rf.state, term, requestVoteArgs.LastLogTerm)
 
-	votes := 1 // must vote self, so init 1.
+	TrueVotes := 1 // must vote self, so init 1.
 	votesLock := deadlock.Mutex{}
 	cond := sync.NewCond(&votesLock)
 	finish := 1
@@ -498,40 +503,43 @@ func (rf *Raft) startElection() {
 			ok := rf.sendRequestVote(i, requestVoteArgs, requestVoteReply)
 			Debug(dVote, "S%d(%d)->%d send vote request ", rf.me, rf.state, i)
 			if ok {
+				Debug(dVote, "S%d(%d)<-%d receive vote response %v", rf.me, rf.state, i, requestVoteReply.VoteGranted)
 				if requestVoteReply.Term > term {
+					rf.mu.Lock()
 					rf.becomeFollower(requestVoteReply.Term)
+					rf.mu.Unlock()
 					cond.Broadcast()
 					finish++
 					return
 				}
 				// DPrintf("Request vote(%t) %d/%d by candidate %d.", requestVoteReply.VoteGranted, i, len(rf.peers), rf.me)
+				votesLock.Lock()
 				if requestVoteReply.VoteGranted {
-					votesLock.Lock()
-					votes++
-					votesLock.Unlock()
+					TrueVotes++
 				}
+				votesLock.Unlock()
 			}
 			cond.Broadcast()
 			finish++
 		}(i)
 	}
 	votesLock.Lock()
-	for votes <= len(rf.peers)/2 && finish != len(rf.peers) {
+	for TrueVotes <= len(rf.peers)/2 && finish != len(rf.peers) {
 		cond.Wait()
 	}
 	// DPrintf("%d's election ends with votes %d.", rf.me, votes)
-	if votes > len(rf.peers)/2 {
-		Debug(dVote, "S%d CANDIDATE(%d) election success(VOTEs:%d).", rf.me, rf.state, votes)
+	if TrueVotes > len(rf.peers)/2 {
+		Debug(dVote, "S%d CANDIDATE(%d) election success(VOTEs:%d).", rf.me, rf.state, TrueVotes)
 		if rf.state == CANDIDATE {
-			Debug(dLog, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
 			// When a leader first comes to power,
 			// it initializes all nextIndex values to the index just after the last one in its log (11 in Figure 7).
 			rf.mu.Lock()
+			Debug(dLeader, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
+			rf.state = LEADER
 			for i := 0; i < len(rf.peers); i++ {
 				rf.nextIndex[i] = len(rf.log)
 				rf.matchIndex[i] = 0
 			}
-			rf.state = LEADER
 			rf.mu.Unlock()
 			go rf.Heartbeat() // send initial empty AppendEntries RPCs
 		} else if rf.state == PRE_CANDIDATE {
@@ -539,14 +547,13 @@ func (rf *Raft) startElection() {
 			defer rf.startElection()
 		}
 	} else {
-		Debug(dVote, "S%d CANDIDATE(%d) election failed.(VOTEs:%d).", rf.me, rf.state, votes)
-		rf.becomeFollower(rf.currentTerm)
+		Debug(dVote, "S%d CANDIDATE(%d) election failed.(VOTEs:%d).", rf.me, rf.state, TrueVotes)
+		rf.becomeFollower(term - 1)
 	}
 	votesLock.Unlock()
 	if rf.state == FOLLOWER {
 		rf.votedFor = -1
 	}
-
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -598,9 +605,7 @@ func (rf *Raft) buildHeartbeatInfo(peer int) *AppendEntries {
 
 func (rf *Raft) Heartbeat() {
 	// no need to : var wg sync.WaitGroup
-	rf.mu.Lock()
 	term, isLeader := rf.GetState()
-	rf.mu.Unlock()
 	if !isLeader {
 		return
 	}
