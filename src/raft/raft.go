@@ -68,9 +68,9 @@ type LogEntry struct {
 }
 
 const ( // metric: ms
-	ELECTION_TIMEWAIT_LOW  = 300
-	ELECTION_TIMEWAIT_HIGH = 800
-	HEARTBEAT_INTERVAL     = 100
+	ELECTION_TIMEWAIT_LOW  = 500
+	ELECTION_TIMEWAIT_HIGH = 1100
+	HEARTBEAT_INTERVAL     = 150
 )
 
 const (
@@ -132,6 +132,16 @@ type Raft struct {
 
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
+}
+
+type InstallSnapshot struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
 }
 
 // return currentTerm and whether this server
@@ -240,7 +250,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.state)
+	rf.persister.SaveStateAndSnapshot(w.Bytes(), snapshot)
 }
 
 //
@@ -253,6 +268,7 @@ type RequestVoteArgs struct {
 	CandidateID  int
 	LastLogIndex int
 	LastLogTerm  int
+	PreVote      bool
 }
 
 //
@@ -300,22 +316,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	term, isLeader := rf.GetState()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = term
 	if args.Term < term && args.LastLogIndex != 0 {
 		reply.VoteGranted = false
 		Debug(dVote, "S%d->%d vote False due to TERM %d ahead of %d", rf.me, args.CandidateID, rf.currentTerm, args.Term)
 		return
 	}
-	if args.Term == term && rf.votedFor != -1 && rf.votedFor != args.CandidateID {
+	if args.Term == term && (rf.votedFor != -1 || rf.votedFor != args.CandidateID) {
 		reply.VoteGranted = false
 		Debug(dVote, "S%d->%d vote False due to votedFor %d not %d", rf.me, args.CandidateID, rf.votedFor, args.CandidateID)
 		return
 	}
 	if args.Term > term {
-		Debug(dDrop, "S%d(%d) to FOLLOWER due to TERM %d out-of-date %d", rf.me, rf.state, rf.currentTerm, args.Term)
-		rf.becomeFollower(args.Term)
+		if !args.PreVote { // Never change our term in response to a PreVote
+			Debug(dDrop, "S%d(%d) to FOLLOWER due to TERM %d out-of-date %d", rf.me, rf.state, rf.currentTerm, args.Term)
+			rf.becomeFollower(args.Term)
+		}
 	}
-
 	LastLogIndex := len(rf.log) - 1
 	LastLogTerm := rf.log[LastLogIndex].Term
 	Debug(dVote, "S%d(%d)<-%d checked term for vote request for term %d", rf.me, rf.state, args.CandidateID, args.Term)
@@ -335,10 +351,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
 		return
 	}
-
 	rf.HeartbeatTime = time.Now()
 	reply.VoteGranted = true
-	rf.votedFor = args.CandidateID
+	reply.Term = rf.currentTerm
+	if !args.PreVote {
+		rf.votedFor = args.CandidateID
+	}
 	rf.persist()
 	Debug(dVote, "S%d(%d)->%d vote True", rf.me, rf.state, args.CandidateID)
 	return
@@ -349,7 +367,6 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	// set currentTerm = T, convert to follower
 	term, isLeader := rf.GetState()
 	rf.mu.Lock()
-	rf.HeartbeatTime = time.Now()
 	reply.Term = term
 	if args.Term < term { //outdated leader
 		Debug(dDrop, "S%d(Term: %d) got heartbeat from outdated TERM %d, discard", rf.me, term, args.Term)
@@ -357,16 +374,17 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		rf.mu.Unlock()
 		return
 	}
-	if args.Term > term { // give up leader because others is
-		//DPrintf("%d changed to FOLLOWER due to term %d out-of-date %d", rf.me, term, args.Term)
-		Debug(dDrop, "S%d FOLLOWER(TERM %d) out-of-date %d or give up identity", rf.me, term, args.Term)
-		rf.becomeFollower(args.Term)
-	}
 	if isLeader && args.Term == term { // received another LEADER's message? turn to FOLLOWER
 		Debug(dDrop, "S%d LEADER(Term: %d) got heartbeat from same TERM %d, turn to FOLLOWER", rf.me, term, args.Term)
 		rf.becomeFollower(term)
 		rf.mu.Unlock()
 		return
+	}
+	rf.HeartbeatTime = time.Now()
+	if args.Term > term { // give up leader because others is
+		//DPrintf("%d changed to FOLLOWER due to term %d out-of-date %d", rf.me, term, args.Term)
+		Debug(dDrop, "S%d FOLLOWER(TERM %d) out-of-date %d or give up identity", rf.me, term, args.Term)
+		rf.becomeFollower(args.Term)
 	}
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if args.PrevLogIndex >= len(rf.log) {
@@ -384,7 +402,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		reply.Success = false
 		reply.XTerm = rf.log[args.PrevLogIndex].Term
 		firstIdx := args.PrevLogIndex
-		for firstIdx > 0 && rf.log[firstIdx-1].Term == args.PrevLogIndex {
+		for firstIdx > 0 && rf.log[firstIdx-1].Term == reply.XTerm {
 			firstIdx--
 		}
 		reply.XIndex = firstIdx
@@ -512,21 +530,25 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.HeartbeatTime = time.Now()
 	term := rf.currentTerm // Term may not be the same as the rf.currentTerm at which the surrounding code decided to become a Candidate.
+	pre := false
 	if rf.state == PRE_CANDIDATE {
 		term++
+		pre = true
 	}
-	rf.mu.Unlock()
 	requestVoteArgs := &RequestVoteArgs{
 		Term:         term,
 		CandidateID:  rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		PreVote:      pre,
 	}
+	rf.mu.Unlock()
 	//DPrintf("%d Start an election(for term: %d).", rf.me, term)
-	Debug(dVote, "S%d(%d) start election(for TERM: %d) with LastLogTerm %d.",
-		rf.me, rf.state, term, requestVoteArgs.LastLogTerm)
+	Debug(dVote, "S%d(%d) start election(pre: %v, for TERM: %d) with LastLogTerm %d.",
+		rf.me, rf.state, pre, term, requestVoteArgs.LastLogTerm)
 
 	TrueVotes := 1 // must vote self, so init 1.
+	FalseVotes := 0
 	votesLock := deadlock.Mutex{}
 	cond := sync.NewCond(&votesLock)
 	finish := 1
@@ -554,6 +576,9 @@ func (rf *Raft) startElection() {
 				if requestVoteReply.VoteGranted {
 					TrueVotes++
 					cond.Broadcast()
+				} else {
+					FalseVotes++
+					cond.Broadcast()
 				}
 				votesLock.Unlock()
 			}
@@ -562,7 +587,7 @@ func (rf *Raft) startElection() {
 		}(i)
 	}
 	votesLock.Lock()
-	for TrueVotes <= len(rf.peers)/2 && finish != len(rf.peers) {
+	for (TrueVotes <= len(rf.peers)/2 && FalseVotes <= len(rf.peers)/2) && finish != len(rf.peers) {
 		cond.Wait()
 	}
 	// DPrintf("%d's election ends with votes %d.", rf.me, votes)
@@ -586,7 +611,7 @@ func (rf *Raft) startElection() {
 		}
 	} else {
 		Debug(dVote, "S%d CANDIDATE(%d) election failed.(VOTEs:%d).", rf.me, rf.state, TrueVotes)
-		rf.becomeFollower(term - 1)
+		rf.becomeFollower(rf.currentTerm)
 	}
 	votesLock.Unlock()
 	if rf.state == FOLLOWER {
@@ -627,7 +652,7 @@ func (rf *Raft) buildHeartbeatInfo(peer int) *AppendEntries {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	prevLogIndex := 0
-	if rf.matchIndex[peer] == 0 { // for new Leader to use
+	if rf.matchIndex[peer] == 0 && rf.nextIndex[peer] > 0 { // for new Leader to use
 		prevLogIndex = rf.nextIndex[peer] - 1
 	} else {
 		prevLogIndex = rf.matchIndex[peer]
@@ -689,7 +714,7 @@ func (rf *Raft) Heartbeat() {
 					break
 				}
 				rf.mu.Lock()
-				firstIdx := appendEntries.PrevLogIndex
+				firstIdx := minInt(appendEntries.PrevLogIndex, len(rf.log))
 				for firstIdx > 0 && rf.log[firstIdx-1].Term == heartbeatReply.XTerm {
 					firstIdx--
 				}
@@ -734,6 +759,10 @@ func (rf *Raft) Heartbeat() {
 	Debug(dLeader, "S%d(%d) AppendEntry ends(VOTEs:%d).", rf.me, rf.state, votes)
 	if votes > len(rf.peers)/2 {
 		if endIdx != rf.commitIndex {
+			if rf.log[endIdx].Term != term { // 只能提交自己当前 term 的 log
+				votesLock.Unlock()
+				return
+			}
 			rf.commitIndex = endIdx
 			Debug(dCommit, "S%d LEADER AppendEntry commits(TERM:%d, commitIndex:%d).", rf.me, rf.currentTerm, rf.commitIndex)
 		}
