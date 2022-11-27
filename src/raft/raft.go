@@ -93,8 +93,8 @@ type AppendEntries struct {
 type HeartbeatReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-	XIndex  int
-	XTerm   int
+	XTerm   int  // term in the conflicting entry (if any)
+	XIndex  int  // index of first entry with that term (if any)
 }
 
 //
@@ -132,6 +132,10 @@ type Raft struct {
 
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
+
+	// For 2D Snapshot:
+	LastIncludedTerm  int
+	LastIncludedIndex int
 }
 
 type InstallSnapshot struct {
@@ -160,14 +164,14 @@ func (rf *Raft) GetState() (int, bool) {
 // If there exists an N such that N > commitIndex, a majority
 // of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
 func (rf *Raft) checkCommit() {
-	for N := len(rf.log) - 1; N > rf.commitIndex && rf.log[N].Term == rf.currentTerm; N-- {
+	for N := len(rf.log) - 1; N > rf.commitIndex-rf.LastIncludedIndex && rf.log[N].Term == rf.currentTerm; N-- {
 		nReplicated := 0
 		for i := 0; i < len(rf.peers); i++ {
-			if rf.matchIndex[i] >= N && rf.log[N].Term == rf.currentTerm {
+			if rf.matchIndex[i] >= N+rf.LastIncludedIndex && rf.log[N].Term == rf.currentTerm {
 				nReplicated += 1
 			}
 			if nReplicated > len(rf.peers)/2 {
-				rf.commitIndex = N
+				rf.commitIndex = N + rf.LastIncludedIndex
 				Debug(dLog, "S%d exists major commit with index %d to apply", rf.me, rf.commitIndex)
 				go rf.Apply2StateMachine()
 				break
@@ -195,6 +199,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.LastIncludedIndex)
+	e.Encode(rf.LastIncludedTerm)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -224,12 +230,18 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm, votedFor int
 	var log []LogEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+	var LastIncludedTerm, LastIncludedIndex int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
+		d.Decode(&LastIncludedTerm) != nil || d.Decode(&LastIncludedIndex) != nil {
 		return
 	} else {
+		rf.mu.Lock()
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.LastIncludedIndex = LastIncludedIndex
+		rf.LastIncludedTerm = LastIncludedTerm
+		rf.mu.Unlock()
 	}
 }
 
@@ -244,6 +256,13 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
+func cutSlice(logs []LogEntry, idx int, term int) []LogEntry {
+	var newLog []LogEntry
+	newLog = append(newLog, LogEntry{Term: term})
+	newLog = append(newLog, logs[idx:]...)
+	return newLog
+}
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -251,10 +270,27 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
+	if index <= rf.LastIncludedIndex {
+		Debug(dError, "S%d ask snapshot to shotted idx %d/%d", rf.me, index, rf.LastIncludedIndex)
+		return
+	} else {
+		rf.LastIncludedTerm = rf.getLogAt(index).Term
+		origin_len := len(rf.log)
+		Debug(dSnap, "S%d ask snapshot to index %d(term:%d, lastShotidx: %d)",
+			rf.me, index, rf.LastIncludedTerm, rf.LastIncludedIndex)
+		rf.log = cutSlice(rf.log, index-rf.LastIncludedIndex+1, rf.LastIncludedTerm)
+		rf.LastIncludedIndex = index
+		Debug(dSnap, "S%d successfully trim log len %d to %d", rf.me, origin_len, len(rf.log))
+	}
 	defer rf.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.state)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.LastIncludedIndex)
+	e.Encode(rf.LastIncludedTerm)
 	rf.persister.SaveStateAndSnapshot(w.Bytes(), snapshot)
 }
 
@@ -281,6 +317,10 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (rf *Raft) getLogAt(idx int) LogEntry {
+	return rf.log[idx-rf.LastIncludedIndex]
+}
+
 func (rf *Raft) becomeFollower(term int) {
 	rf.state = FOLLOWER
 	rf.HeartbeatTime = time.Now()
@@ -294,6 +334,7 @@ func (rf *Raft) becomeFollower(term int) {
 
 func (rf *Raft) becomeCandidate(pre bool) {
 	rf.mu.Lock()
+	rf.HeartbeatTime = time.Now()
 	if pre {
 		rf.state = PRE_CANDIDATE
 		rf.votedFor = -1
@@ -332,20 +373,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.becomeFollower(args.Term)
 		}
 	}
-	LastLogIndex := len(rf.log) - 1
-	LastLogTerm := rf.log[LastLogIndex].Term
+	LastLogIndex := len(rf.log) + rf.LastIncludedIndex - 1
+	LastLogTerm := rf.getLogAt(LastLogIndex).Term
 	Debug(dVote, "S%d(%d)<-%d checked term for vote request for term %d", rf.me, rf.state, args.CandidateID, args.Term)
 	if args.LastLogTerm < LastLogTerm {
 		reply.VoteGranted = false
 		Debug(dVote, "S%d->%d FOLLOWER vote False LastLogTERM %d not up-to-date with %d",
 			rf.me, args.CandidateID, LastLogTerm, args.LastLogTerm)
 		return
-	} else if rf.log[LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex < LastLogIndex {
+	} else if rf.getLogAt(LastLogIndex).Term == args.LastLogTerm && args.LastLogIndex < LastLogIndex {
 		reply.VoteGranted = false
 		Debug(dVote, "S%d->%d FOLLOWER vote False LastLogIndex %d not up-to-date with %d",
 			rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
 		return
-	} else if isLeader && rf.log[LastLogIndex].Term == args.LastLogTerm && args.LastLogIndex == LastLogIndex {
+	} else if isLeader && rf.getLogAt(LastLogIndex).Term == args.LastLogTerm && args.LastLogIndex == LastLogIndex {
 		reply.VoteGranted = false
 		Debug(dVote, "S%d->%d FOLLOWER vote False LastLogIndex %d not up-to-date with %d",
 			rf.me, args.CandidateID, LastLogIndex, args.LastLogTerm)
@@ -387,26 +428,26 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 		rf.becomeFollower(args.Term)
 	}
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	if args.PrevLogIndex >= len(rf.log) {
+	if args.PrevLogIndex >= len(rf.log)+rf.LastIncludedIndex {
 		reply.Success = false
 		Debug(dError, "S%d<-%d FOLLOWER heartbeat PrevLogIndex %d, exceeds len(logs) %d(with %d logs)",
-			rf.me, args.LeaderId, args.PrevLogIndex, len(rf.log), len(args.Entries))
-		reply.XIndex = len(rf.log)
+			rf.me, args.LeaderId, args.PrevLogIndex, len(rf.log)+rf.LastIncludedIndex, len(args.Entries))
+		reply.XIndex = len(rf.log) + rf.LastIncludedIndex
 		reply.XTerm = -1
 		rf.mu.Unlock()
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.getLogAt(args.PrevLogIndex).Term != args.PrevLogTerm {
 		Debug(dError, "S%d<-%d FOLLOWER heartbeat mismatch PrevLogTerm, actual %d, given %d, prevLogIndex: %d(with %d logs)",
-			rf.me, args.LeaderId, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm, args.PrevLogIndex, len(args.Entries))
+			rf.me, args.LeaderId, rf.getLogAt(args.PrevLogIndex).Term, args.PrevLogTerm, args.PrevLogIndex, len(args.Entries))
 		reply.Success = false
-		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XTerm = rf.getLogAt(args.PrevLogIndex).Term
 		firstIdx := args.PrevLogIndex
-		for firstIdx > 0 && rf.log[firstIdx-1].Term == reply.XTerm {
+		for firstIdx > 0 && rf.getLogAt(firstIdx-1).Term == reply.XTerm {
 			firstIdx--
 		}
 		reply.XIndex = firstIdx
-		rf.log = rf.log[:args.PrevLogIndex]
+		rf.log = rf.log[:args.PrevLogIndex-rf.LastIncludedIndex]
 		rf.persist()
 		rf.mu.Unlock()
 		return
@@ -417,10 +458,10 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	// Any elements following the entries sent by the leader MUST be kept.
 	// Here I start comparing from "PrevLogIndex".
 	if len(args.Entries) > 0 {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+		rf.log = append(rf.log[:args.PrevLogIndex-rf.LastIncludedIndex+1], args.Entries...)
 	}
 	rf.persist()
-	endIdx := len(rf.log) - 1
+	endIdx := len(rf.log) + rf.LastIncludedIndex - 1
 	rf.mu.Unlock()
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = minInt(args.LeaderCommit, endIdx)
@@ -428,7 +469,7 @@ func (rf *Raft) RequestHeartbeat(args *AppendEntries, reply *HeartbeatReply) {
 	}
 	reply.Success = true
 	Debug(dInfo, "S%d<-S%d received Heartbeat term %d with %d logs(prevLog:%d -> ends logs:%d), reply %t, update log to %v",
-		rf.me, args.LeaderId, args.Term, len(args.Entries), args.PrevLogIndex, len(rf.log)-1, reply.Success, rf.log)
+		rf.me, args.LeaderId, args.Term, len(args.Entries), args.PrevLogIndex, len(rf.log)+rf.LastIncludedIndex-1, reply.Success, rf.log)
 }
 
 //
@@ -500,8 +541,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, logEntry)
 	rf.persist()
 	Debug(dLeader, "S%d LEADER got a log command %v（Entry Term %d), now have %d logs",
-		rf.me, command, logEntry.Term, len(rf.log))
-	return len(rf.log) - 1, term, isLeader
+		rf.me, command, logEntry.Term, len(rf.log)+rf.LastIncludedIndex)
+	return len(rf.log) + rf.LastIncludedIndex - 1, term, isLeader
 }
 
 //
@@ -538,8 +579,8 @@ func (rf *Raft) startElection() {
 	requestVoteArgs := &RequestVoteArgs{
 		Term:         term,
 		CandidateID:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		LastLogIndex: len(rf.log) + rf.LastIncludedIndex - 1,
+		LastLogTerm:  rf.getLogAt(len(rf.log) + rf.LastIncludedIndex - 1).Term,
 		PreVote:      pre,
 	}
 	rf.mu.Unlock()
@@ -600,7 +641,7 @@ func (rf *Raft) startElection() {
 			Debug(dLeader, "S%d LEADER for TERM %d, establishing its authority", rf.me, rf.currentTerm)
 			rf.state = LEADER
 			for i := 0; i < len(rf.peers); i++ {
-				rf.nextIndex[i] = len(rf.log)
+				rf.nextIndex[i] = len(rf.log) + rf.LastIncludedIndex
 				rf.matchIndex[i] = 0
 			}
 			rf.mu.Unlock()
@@ -651,17 +692,17 @@ func (rf *Raft) ticker() {
 func (rf *Raft) buildHeartbeatInfo(peer int) *AppendEntries {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	prevLogIndex := 0
-	if rf.matchIndex[peer] == 0 && rf.nextIndex[peer] > 0 { // for new Leader to use
+	prevLogIndex := rf.LastIncludedIndex
+	if rf.matchIndex[peer] == rf.LastIncludedIndex && rf.nextIndex[peer] > rf.LastIncludedIndex { // for new Leader to use
 		prevLogIndex = rf.nextIndex[peer] - 1
 	} else {
 		prevLogIndex = rf.matchIndex[peer]
 	}
-	prevLogTerm := rf.log[prevLogIndex].Term
+	prevLogTerm := rf.getLogAt(prevLogIndex).Term
 
 	var entries []LogEntry
-	if prevLogIndex+1 < len(rf.log) {
-		entries = rf.log[prevLogIndex+1:]
+	if prevLogIndex+1 < len(rf.log)+rf.LastIncludedIndex {
+		entries = rf.log[prevLogIndex+1-rf.LastIncludedIndex:]
 	}
 	return &AppendEntries{rf.currentTerm, rf.me, prevLogIndex,
 		prevLogTerm, entries, rf.commitIndex}
@@ -678,7 +719,7 @@ func (rf *Raft) Heartbeat() {
 	votesLock := deadlock.Mutex{}
 	cond := sync.NewCond(&votesLock)
 	finish := 1
-	endIdx := len(rf.log) - 1
+	endIdx := len(rf.log) + rf.LastIncludedIndex - 1
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			// checked above: still leader?
@@ -686,7 +727,7 @@ func (rf *Raft) Heartbeat() {
 		}
 		go func(i int) {
 			if rf.state != LEADER {
-				finish++
+				finish = len(rf.peers)
 				cond.Broadcast()
 				return
 			}
@@ -714,11 +755,11 @@ func (rf *Raft) Heartbeat() {
 					break
 				}
 				rf.mu.Lock()
-				firstIdx := minInt(appendEntries.PrevLogIndex, len(rf.log))
-				for firstIdx > 0 && rf.log[firstIdx-1].Term == heartbeatReply.XTerm {
+				firstIdx := minInt(appendEntries.PrevLogIndex, len(rf.log)+rf.LastIncludedIndex)
+				for firstIdx > rf.LastIncludedIndex && rf.getLogAt(firstIdx-1).Term == heartbeatReply.XTerm {
 					firstIdx--
 				}
-				if firstIdx == 0 || rf.log[firstIdx].Term != heartbeatReply.XTerm {
+				if firstIdx == rf.LastIncludedIndex || rf.getLogAt(firstIdx).Term != heartbeatReply.XTerm {
 					rf.nextIndex[i] = heartbeatReply.XIndex
 				} else {
 					rf.nextIndex[i] = firstIdx
@@ -738,7 +779,7 @@ func (rf *Raft) Heartbeat() {
 				rf.mu.Lock()
 				// Don't use this, for appendEntries.PrevLogIndex may change due to delete FOLLOWER
 				rf.matchIndex[i] = appendEntries.PrevLogIndex + len(appendEntries.Entries)
-				rf.nextIndex[i] = len(rf.log)
+				rf.nextIndex[i] = len(rf.log) + rf.LastIncludedIndex
 				rf.mu.Unlock()
 				Debug(dLeader, "S%d<-S%d LEADER heartbeat reply(%t), set its nextIdx=%d, matchIdx=%d",
 					rf.me, i, heartbeatReply.Success, rf.nextIndex[i], rf.matchIndex[i])
@@ -759,7 +800,7 @@ func (rf *Raft) Heartbeat() {
 	Debug(dLeader, "S%d(%d) AppendEntry ends(VOTEs:%d).", rf.me, rf.state, votes)
 	if votes > len(rf.peers)/2 {
 		if endIdx != rf.commitIndex {
-			if rf.log[endIdx].Term != term { // 只能提交自己当前 term 的 log
+			if rf.getLogAt(endIdx).Term != term { // 只能提交自己当前 term 的 log
 				votesLock.Unlock()
 				return
 			}
@@ -776,17 +817,17 @@ func (rf *Raft) Apply2StateMachine() {
 	defer rf.mu.Unlock()
 	for applyIdx := rf.lastApplied + 1; applyIdx <= rf.commitIndex; applyIdx++ {
 		applyMsg := ApplyMsg{
-			Command:      rf.log[applyIdx].Command,
+			Command:      rf.getLogAt(applyIdx).Command,
 			CommandIndex: applyIdx,
 			CommandValid: true,
 		}
 		rf.mu.Unlock()
+		Debug(dLog2, "S%d applys(TERM:%d, lastApplied->%d) command %v.",
+			rf.me, rf.currentTerm, rf.lastApplied, rf.getLogAt(applyIdx).Command)
 		rf.applyCh <- applyMsg
 		rf.mu.Lock()
 		rf.lastApplied = applyIdx
 		// 当领导者将日志项成功复制至集群大多数节点的时候，日志项处于 committed 状态，领导者可将这个日志项应用（apply）到自己的状态机中
-		Debug(dLog2, "S%d applys(TERM:%d, lastApplied->%d) command %v.",
-			rf.me, rf.currentTerm, rf.lastApplied, rf.log[applyIdx].Command)
 	}
 }
 
@@ -819,6 +860,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = 1
 	}
+	rf.LastIncludedIndex = 0
+	rf.LastIncludedTerm = 0
 	rf.log = append(rf.log, LogEntry{Term: 0}) // a naive item to make idx start from 1.
 	rf.state = FOLLOWER                        // When servers start up, they begin as followers.
 
